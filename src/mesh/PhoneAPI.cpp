@@ -31,6 +31,8 @@
 #include "Throttle.h"
 #include <RTC.h>
 
+int pauseBluetoothLoggingCount = 0; // number of active requests to pause BT logging (across all PhoneAPI instances)
+
 PhoneAPI::PhoneAPI()
 {
     lastContactMsec = millis();
@@ -61,7 +63,7 @@ void PhoneAPI::handleStartConfig()
     } else {
         state = STATE_SEND_MY_INFO;
     }
-    pauseBluetoothLogging = true;
+    holdPauseBluetoothLogging();
     spiLock->lock();
     filesManifest = getFiles("/", 10);
     spiLock->unlock();
@@ -96,7 +98,7 @@ void PhoneAPI::close()
         fromRadioNum = 0;
         config_nonce = 0;
         config_state = 0;
-        pauseBluetoothLogging = false;
+        releasePauseBluetoothLogging();
         heartbeatReceived = false;
     }
 }
@@ -468,7 +470,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         break;
 
     case STATE_SEND_PACKETS:
-        pauseBluetoothLogging = false;
+        releasePauseBluetoothLogging();
         // Do we have a message from the mesh or packet from the local device?
         LOG_DEBUG("FromRadio=STATE_SEND_PACKETS");
         if (queueStatusPacketForPhone) {
@@ -522,7 +524,7 @@ void PhoneAPI::sendConfigComplete()
     fromRadioScratch.config_complete_id = config_nonce;
     config_nonce = 0;
     state = STATE_SEND_PACKETS;
-    pauseBluetoothLogging = false;
+    releasePauseBluetoothLogging();
 }
 
 void PhoneAPI::releasePhonePacket()
@@ -733,4 +735,23 @@ int PhoneAPI::onNotify(uint32_t newValue)
     }
 
     return timeout ? -1 : 0; // If we timed out, MeshService should stop iterating through observers as we just removed one
+}
+
+void PhoneAPI::holdPauseBluetoothLogging()
+{
+    if (!pauseBluetoothLoggingHeld) {
+        pauseBluetoothLoggingHeld = true;
+        pauseBluetoothLoggingCount++;
+        pauseBluetoothLogging = true;
+    }
+}
+
+void PhoneAPI::releasePauseBluetoothLogging()
+{
+    if (pauseBluetoothLoggingHeld) {
+        pauseBluetoothLoggingHeld = false;
+        if (pauseBluetoothLoggingCount > 0)
+            pauseBluetoothLoggingCount--;
+        pauseBluetoothLogging = pauseBluetoothLoggingCount > 0;
+    }
 }

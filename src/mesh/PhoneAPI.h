@@ -54,6 +54,8 @@ class PhoneAPI
 
     bool heartbeatReceived = false;
 
+    bool pauseBluetoothLoggingHeld = false; // true if we have incremented the shared pauseBluetoothLoggingCount
+
     // Hashmap of timestamps for last time we received a packet on the API per portnum
     std::unordered_map<meshtastic_PortNum, uint32_t> lastPortNumToRadio;
     uint32_t recentToRadioPacketIds[20]; // Last 20 ToRadio MeshPacket IDs we have seen
@@ -174,4 +176,7 @@ class PhoneAPI
 
     /// If the mesh service tells us fromNum has changed, tell the phone
     virtual int onNotify(uint32_t newValue) override;
+
+    void holdPauseBluetoothLogging();
+    void releasePauseBluetoothLogging();
 };
