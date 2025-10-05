@@ -1,8 +1,10 @@
 #pragma once
 
 #include "StreamAPI.h"
+#include <array>
 
 #define SERVER_API_DEFAULT_PORT 4403
+#define SERVER_API_MAX_TCP_CLIENTS 4
 
 /**
  * Provides both debug printing and, if the client starts sending protobufs to us, switches to send/receive protobufs
@@ -21,6 +23,9 @@ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSTh
     /// override close to also shutdown the TCP link
     virtual void close();
 
+    /// Public helper so APIServerPort can detect dropped connections
+    bool isAlive() { return checkIsConnected(); }
+
   protected:
     /// We override this method to prevent publishing EVENT_SERIAL_CONNECTED/DISCONNECTED for wifi links (we want the board to
     /// stay in the POWERED state to prevent disabling wifi)
@@ -37,12 +42,9 @@ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSTh
  */
 template <class T, class U> class APIServerPort : public U, private concurrency::OSThread
 {
-    /** The currently open port
-     *
-     * FIXME: We currently only allow one open TCP connection at a time, because we depend on the loop() call in this class to
-     * delegate to the worker.  Once coroutines are implemented we can relax this restriction.
-     */
-    T *openAPI = NULL;
+    // Array of currently open connections. Newest is always at index 0.
+    std::array<T *, SERVER_API_MAX_TCP_CLIENTS> clients = {};
+
 #if defined(RAK_4631) || defined(RAK11310)
     // Track wait time for RAK13800 Ethernet requests
     int32_t waitTime = 100;
@@ -50,6 +52,17 @@ template <class T, class U> class APIServerPort : public U, private concurrency:
 
   public:
     explicit APIServerPort(int port);
+
+    // Destructor, for deInitApiServer
+    ~APIServerPort()
+    {
+        for (auto &c : clients) {
+            if (c) {
+                delete c;
+                c = nullptr;
+            }
+        }
+    }
 
     void init();
 

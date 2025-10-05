@@ -45,6 +45,25 @@ template <class T, class U> void APIServerPort<T, U>::init()
 
 template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
 {
+    // Delete any dropped connections and compact so nulls stay at the end.
+    for (size_t i = 0; i < clients.size();) {
+        if (clients[i] && !clients[i]->isAlive()) {
+            LOG_INFO("TCP connection %u dropped", (unsigned)i);
+            delete clients[i];
+
+            // Shift items left to fill the gap
+            for (size_t j = i; j < clients.size() - 1; j++) {
+                clients[j] = clients[j + 1];
+            }
+            clients[clients.size() - 1] = nullptr;
+
+            // Do not increment i; re-check the new occupant at index i
+        } else {
+            i++;
+        }
+    }
+
+    // See if there's a new connection to accept
 #ifdef ARCH_ESP32
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 0, 0)
     auto client = U::accept();
@@ -56,9 +75,10 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
 #else
     auto client = U::available();
 #endif
+
     if (client) {
-        // Close any previous connection (see FIXME in header file)
-        if (openAPI) {
+        // If we are full: drop the oldest connection (last entry in clients array)
+        if (clients.back()) {
 #if RAK_4631
             // RAK13800 Ethernet requests periodically take more time
             // This backoff addresses most cases keeping max wait < 1s
@@ -69,11 +89,20 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
                 return waitTime;
             }
 #endif
-            LOG_INFO("Force close previous TCP connection");
-            delete openAPI;
+
+            LOG_INFO("Force closing oldest TCP connection to accept new one");
+            delete clients.back();
+            clients.back() = nullptr;
         }
 
-        openAPI = new T(client);
+        // Shift down so we can insert at index 0
+        for (size_t i = clients.size() - 1; i > 0; i--) {
+            clients[i] = clients[i - 1];
+        }
+
+        // Instantiate new connection and insert at index 0. (Always inserts at index 0 to maintain sort by connection age.)
+        LOG_INFO("Accepting new incoming TCP connection");
+        clients[0] = new T(client);
     }
 
 #if RAK_4631
