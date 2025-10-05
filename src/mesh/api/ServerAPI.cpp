@@ -43,12 +43,21 @@ template <class T, class U> void APIServerPort<T, U>::init()
     U::begin();
 }
 
+template <class T, class U> int APIServerPort<T, U>::countActiveClients() const
+{
+    int count = 0;
+    for (auto *c : clients)
+        if (c)
+            ++count;
+    return count;
+}
+
 template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
 {
     // Delete any dropped connections and compact so nulls stay at the end.
     for (size_t i = 0; i < clients.size();) {
         if (clients[i] && !clients[i]->isAlive()) {
-            LOG_INFO("TCP connection %u dropped", (unsigned)i);
+            LOG_INFO("TCP connection %u dropped (%d active)", (unsigned)i, countActiveClients() - 1);
             delete clients[i];
 
             // Shift items left to fill the gap
@@ -90,7 +99,7 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
             }
 #endif
 
-            LOG_INFO("Force closing oldest TCP connection to accept new one");
+            LOG_INFO("Force closing oldest TCP connection to accept new one (%d active)", countActiveClients() - 1);
             delete clients.back();
             clients.back() = nullptr;
         }
@@ -101,8 +110,8 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
         }
 
         // Instantiate new connection and insert at index 0. (Always inserts at index 0 to maintain sort by connection age.)
-        LOG_INFO("Accepting new incoming TCP connection");
         clients[0] = new T(client);
+        LOG_INFO("Accepting new incoming TCP connection (%d active)", countActiveClients());
     }
 
 #if RAK_4631

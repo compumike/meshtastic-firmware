@@ -53,6 +53,8 @@ template <class T, class U> class APIServerPort : public U, private concurrency:
   public:
     explicit APIServerPort(int port);
 
+    int countActiveClients() const;
+
     // Destructor, for deInitApiServer
     ~APIServerPort()
     {
