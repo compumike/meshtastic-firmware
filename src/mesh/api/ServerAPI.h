@@ -26,6 +26,10 @@ template <class T> class ServerAPI : public StreamAPI, private concurrency::OSTh
     /// Public helper so APIServerPort can detect dropped connections
     bool isAlive() { return checkIsConnected(); }
 
+    // Expose thread enabled/disable status so we can safely delete the per-connection OSThread
+    bool isThreadEnabled() const { return enabled; }
+    void disableThread() { disable(); }
+
   protected:
     /// We override this method to prevent publishing EVENT_SERIAL_CONNECTED/DISCONNECTED for wifi links (we want the board to
     /// stay in the POWERED state to prevent disabling wifi)
@@ -44,6 +48,9 @@ template <class T, class U> class APIServerPort : public U, private concurrency:
 {
     // Array of currently open connections. Newest is always at index 0.
     std::array<T *, SERVER_API_MAX_TCP_CLIENTS> clients = {};
+
+    // Connections that have been disabled and should be deleted on the next pass of runOnce.
+    std::array<T *, SERVER_API_MAX_TCP_CLIENTS> clientsPendingDelete = {};
 
 #if defined(RAK_4631) || defined(RAK11310)
     // Track wait time for RAK13800 Ethernet requests

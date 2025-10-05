@@ -54,11 +54,28 @@ template <class T, class U> int APIServerPort<T, U>::countActiveClients() const
 
 template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
 {
+    // Finish any deletes that were deferred from a prior pass of runOnce.
+    // (These threads are safe to delete now since their thread was disabled in the prior pass.)
+    for (auto &p : clientsPendingDelete) {
+        if (p) {
+            delete p;
+            p = nullptr;
+        }
+    }
+
     // Delete any dropped connections and compact so nulls stay at the end.
     for (size_t i = 0; i < clients.size();) {
         if (clients[i] && !clients[i]->isAlive()) {
             LOG_INFO("TCP connection %u dropped (%d active)", (unsigned)i, countActiveClients() - 1);
-            delete clients[i];
+
+            // Disable thread and remove from clients array
+            T *toDelete = clients[i];
+            toDelete->disableThread();
+
+            // Add it to clientsPendingDelete so we can delete on the next round.
+            // (Careful: it's not safe to delete it now since the thread may still be scheduled for later in this same loop!)
+            clientsPendingDelete[i] = toDelete; // Safe to put in clientsPendingDelete[i] since clientsPendingDelete will be empty
+                                                // at the start of this for loop
 
             // Shift items left to fill the gap
             for (size_t j = i; j < clients.size() - 1; j++) {
@@ -98,10 +115,12 @@ template <class T, class U> int32_t APIServerPort<T, U>::runOnce()
                 return waitTime;
             }
 #endif
-
-            LOG_INFO("Force closing oldest TCP connection to accept new one (%d active)", countActiveClients() - 1);
-            delete clients.back();
+            // Disable oldest and mark for deletion on next pass
+            T *oldest = clients.back();
+            oldest->disableThread();
+            clientsPendingDelete[0] = oldest; // Safe to put in clientsPendingDelete[0] since it must be empty if clients is full!
             clients.back() = nullptr;
+            LOG_INFO("Force closing oldest TCP connection to accept new one (%d active)", countActiveClients());
         }
 
         // Shift down so we can insert at index 0
