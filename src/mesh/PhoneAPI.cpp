@@ -31,9 +31,6 @@
 #include "Throttle.h"
 #include <RTC.h>
 
-// Flag to indicate a heartbeat was received and we should send queue status
-bool heartbeatReceived = false;
-
 PhoneAPI::PhoneAPI()
 {
     lastContactMsec = millis();

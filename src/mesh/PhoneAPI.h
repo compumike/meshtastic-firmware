@@ -52,6 +52,8 @@ class PhoneAPI
 
     uint8_t config_state = 0;
 
+    bool heartbeatReceived = false;
+
     // Hashmap of timestamps for last time we received a packet on the API per portnum
     std::unordered_map<meshtastic_PortNum, uint32_t> lastPortNumToRadio;
     uint32_t recentToRadioPacketIds[20]; // Last 20 ToRadio MeshPacket IDs we have seen
