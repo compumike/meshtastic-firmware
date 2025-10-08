@@ -70,7 +70,7 @@ void PhoneAPI::handleStartConfig()
     spiLock->unlock();
     LOG_DEBUG("Got %d files in manifest", filesManifest.size());
 
-    LOG_INFO("Start API client config");
+    LOG_INFO("Start API client config millis=%u", millis());
     nodeInfoForPhone.num = 0; // Don't keep returning old nodeinfos
     resetReadIndex();
 }
@@ -431,7 +431,11 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         break;
 
     case STATE_SEND_OTHER_NODEINFOS: {
+        if (readIndex == 2) { //  readIndex==2 will be true for the first non-us node
+            LOG_INFO("Start sending nodeinfos millis=%u", millis());
+        }
         LOG_DEBUG("Send known nodes");
+
         if (nodeInfoForPhone.num != 0) {
             // Just in case we stored a different user.id in the past, but should never happen going forward
             sprintf(nodeInfoForPhone.user.id, "!%08x", nodeInfoForPhone.num);
@@ -442,7 +446,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
             // Stay in current state until done sending nodeinfos
             nodeInfoForPhone.num = 0; // We just consumed a nodeinfo, will need a new one next time
         } else {
-            LOG_DEBUG("Done sending nodeinfo");
+            LOG_DEBUG("Done sending %d of %d nodeinfos millis=%u", readIndex, nodeDB->getNumMeshNodes(), millis());
             state = STATE_SEND_FILEMANIFEST;
             // Go ahead and send that ID right now
             return getFromRadio(buf);
@@ -522,7 +526,7 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
 
 void PhoneAPI::sendConfigComplete()
 {
-    LOG_INFO("Config Send Complete");
+    LOG_INFO("Config Send Complete millis=%u", millis());
     fromRadioScratch.which_payload_variant = meshtastic_FromRadio_config_complete_id_tag;
     fromRadioScratch.config_complete_id = config_nonce;
     config_nonce = 0;
