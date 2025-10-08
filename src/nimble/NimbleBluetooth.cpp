@@ -4,6 +4,7 @@
 #include "NimbleBluetooth.h"
 #include "PowerFSM.h"
 
+#include "concurrency/OSThread.h"
 #include "main.h"
 #include "mesh/PhoneAPI.h"
 #include "mesh/mesh-pb-constants.h"
@@ -16,6 +17,10 @@
 #include "NimBLEExtAdvertising.h"
 #include "PowerStatus.h"
 #endif
+
+// Uncomment to debug the cross-task delay when the onRead callback has to wait for the main loop to getFromRadio.
+// (But this logging slows things down when there are lots of packets going to the phone, like initial connection.)
+// #define DEBUG_NIMBLE_ON_READ_TIMING
 
 NimBLECharacteristic *fromNumCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
@@ -34,8 +39,8 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
     bool has_fromRadio = false;
     uint8_t fromRadioBytes[meshtastic_FromRadio_size] = {0};
     size_t numBytes = 0;
-    bool hasChecked = false;
-    bool phoneWants = false;
+    volatile bool hasChecked = false;
+    volatile bool phoneWants = false;
 
   protected:
     virtual int32_t runOnce() override
@@ -64,7 +69,9 @@ class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
         PhoneAPI::onNowHasData(fromRadioNum);
 
         uint8_t cc = bleServer->getConnectedCount();
-        LOG_DEBUG("BLE notify fromNum: %d connections: %d", fromRadioNum, cc);
+
+        // This logging slows things down when there are lots of packets going to the phone, like initial connection:
+        // LOG_DEBUG("BLE notify fromNum: %d connections: %d", fromRadioNum, cc);
 
         uint8_t val[4];
         put_le32(val, fromRadioNum);
@@ -103,10 +110,15 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
         if (memcmp(lastToRadio, val.data(), val.length()) != 0) {
             if (bluetoothPhoneAPI->queue_size < 3) {
                 memcpy(lastToRadio, val.data(), val.length());
-                std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
-                bluetoothPhoneAPI->nimble_queue.at(bluetoothPhoneAPI->queue_size) = val;
-                bluetoothPhoneAPI->queue_size++;
-                bluetoothPhoneAPI->setIntervalFromNow(0);
+                { // scope for mutex
+                    std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
+                    bluetoothPhoneAPI->nimble_queue.at(bluetoothPhoneAPI->queue_size) = val;
+                    bluetoothPhoneAPI->queue_size++;
+                    bluetoothPhoneAPI->setIntervalFromNow(0);
+                }
+
+                // After releasing the mutex, wake up the main loop if it's sleeping so it can process the new packet.
+                concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
             }
         }
     }
@@ -121,20 +133,52 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 #endif
     {
         int tries = 0;
+
+#ifdef DEBUG_NIMBLE_ON_READ_TIMING
+        int startMillis = millis();
+#endif
+
         bluetoothPhoneAPI->phoneWants = true;
-        while (!bluetoothPhoneAPI->hasChecked && tries < 100) {
+        while (!bluetoothPhoneAPI->hasChecked && tries < 400) {
             bluetoothPhoneAPI->setIntervalFromNow(0);
-            delay(20);
+            concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
+
+            if (bluetoothPhoneAPI->hasChecked) {
+                // we may be able to break even before a delay, if the call to interrupt woke up the main loop and it ran already
+#ifdef DEBUG_NIMBLE_ON_READ_TIMING
+                LOG_DEBUG("onRead: broke before delay after %u ms, %d tries", millis() - startMillis, tries);
+#endif
+                break;
+            }
+
+            delay(tries < 10 ? 2 : 5);
             tries++;
         }
-        std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
-        pCharacteristic->setValue(bluetoothPhoneAPI->fromRadioBytes, bluetoothPhoneAPI->numBytes);
 
-        if (bluetoothPhoneAPI->numBytes != 0) // if we did send something, queue it up right away to reload
-            bluetoothPhoneAPI->setIntervalFromNow(0);
-        bluetoothPhoneAPI->numBytes = 0;
-        bluetoothPhoneAPI->hasChecked = false;
-        bluetoothPhoneAPI->phoneWants = false;
+#ifdef DEBUG_NIMBLE_ON_READ_TIMING
+        int finishMillis = millis();
+        LOG_DEBUG("onRead: hasChecked took %u ms, %d tries", finishMillis - startMillis, tries);
+#endif
+
+        bool sentSomething = false;
+        { // scope for mutex
+            std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
+            pCharacteristic->setValue(bluetoothPhoneAPI->fromRadioBytes, bluetoothPhoneAPI->numBytes);
+
+            if (bluetoothPhoneAPI->numBytes != 0) { // if we did send something, queue it up right away to reload
+                sentSomething = true;
+                bluetoothPhoneAPI->setIntervalFromNow(0);
+            }
+            bluetoothPhoneAPI->numBytes = 0;
+            bluetoothPhoneAPI->hasChecked = false;
+            bluetoothPhoneAPI->phoneWants = false;
+        }
+
+        // After releasing the mutex, if we did send something, wake up the main loop if it's sleeping in case there are more
+        // packets ready to send to the phone.
+        if (sentSomething) {
+            concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
+        }
     }
 };
 
@@ -216,6 +260,23 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
             if (screen)
                 screen->endAlert();
         }
+
+        /* Request a lower-latency, higher-throughput BLE connection.
+
+           See https://developer.apple.com/library/archive/qa/qa1931/_index.html for formulas to calculate values, iOS/macOS
+           constraints, and recommendations. (Android doesn't have specific constraints, but seems to be compatible with the Apple
+           recommendations.)
+
+           minInterval (units of 1.25ms): 15ms = 12
+           maxInterval (units of 1.25ms): 15ms = 12
+           latency: 0 (don't allow peripheral to skip any connection events)
+           timeout (units of 10ms): 6 seconds = 600 (supervision timeout)
+        */
+#ifdef NIMBLE_TWO
+        bleServer->updateConnParams(connInfo.getConnHandle(), 12, 12, 0, 600);
+#else
+        bleServer->updateConnParams(desc->conn_handle, 12, 12, 0, 600);
+#endif
     }
 
 #ifdef NIMBLE_TWO
