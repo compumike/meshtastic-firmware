@@ -22,6 +22,8 @@
 // (But this logging slows things down when there are lots of packets going to the phone, like initial connection.)
 // #define DEBUG_NIMBLE_ON_READ_TIMING
 
+#define NIMBLE_BLUETOOTH_QUEUE_SIZE 3
+
 NimBLECharacteristic *fromNumCharacteristic;
 NimBLECharacteristic *BatteryCharacteristic;
 NimBLECharacteristic *logRadioCharacteristic;
@@ -32,30 +34,64 @@ static bool passkeyShowing;
 class BluetoothPhoneAPI : public PhoneAPI, public concurrency::OSThread
 {
   public:
-    BluetoothPhoneAPI() : concurrency::OSThread("NimbleBluetooth") { nimble_queue.resize(3); }
-    std::vector<NimBLEAttValue> nimble_queue;
+    BluetoothPhoneAPI() : concurrency::OSThread("NimbleBluetooth") {}
+    NimBLEAttValue nimble_queue[NIMBLE_BLUETOOTH_QUEUE_SIZE] = {};
+    // nimble_mutex protects:
+    //  - nimble_queue (reads or writes) and queue_size (writes) for the onWrite callback
     std::mutex nimble_mutex;
-    uint8_t queue_size = 0;
+    volatile uint8_t queue_size = 0;
     bool has_fromRadio = false;
     uint8_t fromRadioBytes[meshtastic_FromRadio_size] = {0};
-    size_t numBytes = 0;
+    volatile size_t numBytes = 0;
     volatile bool hasChecked = false;
     volatile bool phoneWants = false;
 
   protected:
+    bool onReadCallbackIsWaiting() { return hasChecked == false && phoneWants == true; }
+    bool hasWorkToDo() { return onReadCallbackIsWaiting() || queue_size > 0; }
+
     virtual int32_t runOnce() override
     {
-        std::lock_guard<std::mutex> guard(nimble_mutex);
-        if (queue_size > 0) {
-            for (uint8_t i = 0; i < queue_size; i++) {
-                handleToRadio(nimble_queue.at(i).data(), nimble_queue.at(i).length());
+        while (hasWorkToDo()) {
+            // Service onRead first, because the onRead callback blocks NimBLE until we set hasChecked to true!
+            if (onReadCallbackIsWaiting()) {
+                numBytes = getFromRadio(fromRadioBytes);
+                if (numBytes == 0) {
+                    // Client expected a read, but we have nothing to send.
+                    LOG_WARN("NimbleBluetooth: setting hasChecked=true with numBytes=0");
+                }
+                hasChecked = true;
+
+                // Return immediately after setting hasChecked so that our onRead callback can proceed.
+                if (hasWorkToDo()) {
+                    // Allow a minimal delay so the NimBLE task's onRead callback can pick up this packet, and then come back here
+                    // ASAP to handle whatever work is next!
+                    return 1;
+                } else {
+                    // Nothing queued. We can wait for the next callback.
+                    return INT32_MAX;
+                }
             }
-            LOG_DEBUG("Queue_size %u", queue_size);
-            queue_size = 0;
-        }
-        if (hasChecked == false && phoneWants == true) {
-            numBytes = getFromRadio(fromRadioBytes);
-            hasChecked = true;
+
+            // Handle packets we received from onWrite from the phone.
+            if (queue_size > 0) {
+                LOG_DEBUG("NimbleBluetooth: handling ToRadio packet, queue_size=%u", queue_size);
+
+                // Pop the front, holding the mutex only briefly while we pop.
+                NimBLEAttValue val;
+                { // scope for mutex protecting nimble_queue
+                    std::lock_guard<std::mutex> guard(nimble_mutex);
+                    val = nimble_queue[0];
+
+                    // Shift the rest of the queue down
+                    for (uint8_t i = 1; i < queue_size; i++) {
+                        nimble_queue[i - 1] = nimble_queue[i];
+                    }
+                    queue_size--;
+                }
+
+                handleToRadio(val.data(), val.length());
+            }
         }
 
         // the run is triggered via NimbleBluetoothToRadioCallback and NimbleBluetoothFromRadioCallback
@@ -108,16 +144,17 @@ class NimbleBluetoothToRadioCallback : public NimBLECharacteristicCallbacks
         auto val = pCharacteristic->getValue();
 
         if (memcmp(lastToRadio, val.data(), val.length()) != 0) {
-            if (bluetoothPhoneAPI->queue_size < 3) {
+            if (bluetoothPhoneAPI->queue_size < NIMBLE_BLUETOOTH_QUEUE_SIZE) {
                 memcpy(lastToRadio, val.data(), val.length());
-                { // scope for mutex
+
+                { // scope for mutex protecting nimble_queue
                     std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
-                    bluetoothPhoneAPI->nimble_queue.at(bluetoothPhoneAPI->queue_size) = val;
+                    bluetoothPhoneAPI->nimble_queue[bluetoothPhoneAPI->queue_size] = val;
                     bluetoothPhoneAPI->queue_size++;
-                    bluetoothPhoneAPI->setIntervalFromNow(0);
                 }
 
-                // After releasing the mutex, wake up the main loop if it's sleeping so it can process the new packet.
+                // After releasing the mutex, schedule immediate processing of the new packet.
+                bluetoothPhoneAPI->setIntervalFromNow(0);
                 concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
             }
         }
@@ -161,22 +198,20 @@ class NimbleBluetoothFromRadioCallback : public NimBLECharacteristicCallbacks
 #endif
 
         bool sentSomething = false;
-        { // scope for mutex
-            std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
-            pCharacteristic->setValue(bluetoothPhoneAPI->fromRadioBytes, bluetoothPhoneAPI->numBytes);
 
-            if (bluetoothPhoneAPI->numBytes != 0) { // if we did send something, queue it up right away to reload
-                sentSomething = true;
-                bluetoothPhoneAPI->setIntervalFromNow(0);
-            }
-            bluetoothPhoneAPI->numBytes = 0;
-            bluetoothPhoneAPI->hasChecked = false;
-            bluetoothPhoneAPI->phoneWants = false;
+        pCharacteristic->setValue(bluetoothPhoneAPI->fromRadioBytes, bluetoothPhoneAPI->numBytes);
+
+        if (bluetoothPhoneAPI->numBytes != 0) {
+            sentSomething = true;
         }
 
-        // After releasing the mutex, if we did send something, wake up the main loop if it's sleeping in case there are more
-        // packets ready to send to the phone.
+        bluetoothPhoneAPI->numBytes = 0;
+        bluetoothPhoneAPI->phoneWants = false; // clear phoneWants first in case runOnce is active
+        bluetoothPhoneAPI->hasChecked = false;
+
+        // If we did send something, wake up the main loop if it's sleeping in case there are more packets ready to send.
         if (sentSomething) {
+            bluetoothPhoneAPI->setIntervalFromNow(0);
             concurrency::mainDelay.interrupt(); // wake up main loop if sleeping
         }
     }
@@ -304,8 +339,8 @@ class NimbleBluetoothServerCallback : public NimBLEServerCallbacks
         if (bluetoothPhoneAPI) {
             std::lock_guard<std::mutex> guard(bluetoothPhoneAPI->nimble_mutex);
             bluetoothPhoneAPI->close();
+            bluetoothPhoneAPI->phoneWants = false; // clear phoneWants first in case runOnce is active
             bluetoothPhoneAPI->hasChecked = false;
-            bluetoothPhoneAPI->phoneWants = false;
             bluetoothPhoneAPI->numBytes = 0;
             bluetoothPhoneAPI->queue_size = 0;
         }
