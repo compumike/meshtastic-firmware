@@ -434,13 +434,21 @@ size_t PhoneAPI::getFromRadio(uint8_t *buf)
         if (readIndex == 2) { //  readIndex==2 will be true for the first non-us node
             LOG_INFO("Start sending nodeinfos millis=%u", millis());
         }
-        LOG_DEBUG("Send known nodes");
 
         if (nodeInfoForPhone.num != 0) {
             // Just in case we stored a different user.id in the past, but should never happen going forward
             sprintf(nodeInfoForPhone.user.id, "!%08x", nodeInfoForPhone.num);
-            LOG_INFO("nodeinfo: num=0x%x, lastseen=%u, id=%s, name=%s", nodeInfoForPhone.num, nodeInfoForPhone.last_heard,
-                     nodeInfoForPhone.user.id, nodeInfoForPhone.user.long_name);
+
+            // Logging this really slows down sending nodes on initial connection because the serial console is so slow, so only
+            // uncomment if you really need to:
+            // LOG_INFO("nodeinfo: num=0x%x, lastseen=%u, id=%s, name=%s", nodeInfoForPhone.num, nodeInfoForPhone.last_heard,
+            // nodeInfoForPhone.user.id, nodeInfoForPhone.user.long_name);
+
+            // Occasional progress logging. (readIndex==2 will be true for the first non-us node)
+            if (readIndex == 2 || readIndex % 20 == 0) {
+                LOG_DEBUG("nodeinfo: %d/%d", readIndex, nodeDB->getNumMeshNodes());
+            }
+
             fromRadioScratch.which_payload_variant = meshtastic_FromRadio_node_info_tag;
             fromRadioScratch.node_info = nodeInfoForPhone;
             // Stay in current state until done sending nodeinfos
